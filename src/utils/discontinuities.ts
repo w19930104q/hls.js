@@ -15,6 +15,36 @@ export function findFirstFragWithCC(
   return null;
 }
 
+/**
+ * The maximum disagreement (in seconds) between a Program Date Time based
+ * alignment and the content mapping established by identical media sequence
+ * numbers in playlists of the same type. Renditions of the same content can
+ * report slightly different program date times (for example after a playlist
+ * reload). When matching segment numbering already establishes the content
+ * mapping, such discrepancies must not alter it.
+ */
+const MAX_PDT_SEQUENCE_DISAGREEMENT = 1;
+
+/**
+ * Returns the sliding offset that maps `frag` onto the fragment with the same
+ * media sequence number in `refFragments` when both fragments belong to the
+ * same playlist type (e.g. two video levels of one channel), or `null` when
+ * no such established content mapping exists.
+ */
+function getEstablishedSequenceDelta(
+  frag: Fragment,
+  refFragments: Fragment[],
+): number | null {
+  for (let i = 0, len = refFragments.length; i < len; i++) {
+    const refFrag = refFragments[i];
+    if (refFrag?.sn === frag.sn && refFrag.type === frag.type) {
+      const delta = refFrag.start - frag.start;
+      return Number.isFinite(delta) ? delta : null;
+    }
+  }
+  return null;
+}
+
 export function shouldAlignOnDiscontinuities(
   refDetails: LevelDetails | undefined,
   details: LevelDetails,
@@ -168,7 +198,22 @@ export function alignMediaPlaylistByPDT(
     return;
   }
 
-  const delta = dateDifference - (frag.start - refFrag.start);
-  logger.log(`Aligning playlists using PDT (diff: ${delta})`);
+  let delta = dateDifference - (frag.start - refFrag.start);
+  // Playlists of the same type that number the same content with the same
+  // media sequence numbers (such as the levels of one channel) already have
+  // an established content mapping. A small program date time discrepancy
+  // between such playlists must not change that mapping.
+  const sequenceDelta = getEstablishedSequenceDelta(frag, refFragments);
+  if (
+    sequenceDelta !== null &&
+    Math.abs(delta - sequenceDelta) < MAX_PDT_SEQUENCE_DISAGREEMENT
+  ) {
+    logger.log(
+      `Keeping alignment established by media sequence numbers (PDT diff: ${delta}, sequence diff: ${sequenceDelta})`,
+    );
+    delta = sequenceDelta;
+  } else {
+    logger.log(`Aligning playlists using PDT (diff: ${delta})`);
+  }
   adjustSlidingStart(delta, details);
 }
