@@ -633,6 +633,59 @@ export function reassignFragmentLevelIndexes(levels: Level[]) {
   });
 }
 
+/**
+ * Returns a stable identity for a variant level based on its media
+ * characteristics instead of its position in the levels array. The identity
+ * does not include the level `name` (a display label that the playlist can
+ * change between refreshes) nor the pathway, so that a re-ordered or
+ * re-labelled variant from the same CDN keeps matching across multivariant
+ * playlist refreshes.
+ */
+export function getLevelIdentity(level: Level): string {
+  const attrs = level.attrs;
+  const stableVariantId = attrs['STABLE-VARIANT-ID'];
+  if (stableVariantId) {
+    return `stable:${stableVariantId}`;
+  }
+  const mediaKey = [
+    level.bitrate,
+    level.averageBitrate,
+    level.width,
+    level.height,
+    level.frameRate,
+    level.videoRange,
+    level.codecSet,
+    attrs['HDCP-LEVEL'] || '',
+  ].join('-');
+  // Fall back to the variant URI for streams whose variants are not otherwise
+  // distinguishable (for example, audio-only playlists without RESOLUTION).
+  return `media:${mediaKey}:${level.uri}`;
+}
+
+/**
+ * Finds the index of the level in `levels` matching a stable level identity
+ * (as returned by getLevelIdentity) or the identity of another level, or -1
+ * when the variant is no longer part of the playlist.
+ */
+export function findLevelIndexByIdentity(
+  levels: Level[],
+  levelOrIdentity: Level | string | null,
+): number {
+  if (!levelOrIdentity) {
+    return -1;
+  }
+  const identity =
+    typeof levelOrIdentity === 'string'
+      ? levelOrIdentity
+      : getLevelIdentity(levelOrIdentity);
+  for (let i = 0; i < levels.length; i++) {
+    if (getLevelIdentity(levels[i]) === identity) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 function notEqualAfterStrippingQueries(
   uriBefore: string,
   uriAfter: string | undefined,

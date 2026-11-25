@@ -15,6 +15,8 @@ import {
   addSliding,
   adjustSliding,
   computeReloadInterval,
+  findLevelIndexByIdentity,
+  getLevelIdentity,
   mapFragmentIntersection,
   mapPartIntersection,
   mergeDetails,
@@ -2713,3 +2715,94 @@ function expectPlaylistParsingError(object: any, message: string) {
       `Expected error message to start with "${message}"`,
     );
 }
+
+describe('Level identity helpers', function () {
+  function level(data: {
+    bitrate: number;
+    url: string;
+    name?: string;
+    width?: number;
+    height?: number;
+    frameRate?: number;
+    stableVariantId?: string;
+  }): Level {
+    const attrs: Record<string, string> = { BANDWIDTH: String(data.bitrate) };
+    if (data.stableVariantId) {
+      attrs['STABLE-VARIANT-ID'] = data.stableVariantId;
+    }
+    if (data.frameRate !== undefined) {
+      attrs['FRAME-RATE'] = String(data.frameRate);
+    }
+    return new Level({
+      attrs: new AttrList(attrs) as any,
+      bitrate: data.bitrate,
+      name: data.name || '',
+      url: data.url,
+      width: data.width,
+      height: data.height,
+    });
+  }
+
+  it('matches variants by URI and media characteristics when names change', function () {
+    const before = level({
+      bitrate: 2149280,
+      url: 'https://example.com/2149280.m3u8',
+      name: '720',
+      width: 1280,
+      height: 720,
+    });
+    const after = level({
+      bitrate: 2149280,
+      url: 'https://example.com/2149280.m3u8',
+      name: 'HD-720',
+      width: 1280,
+      height: 720,
+    });
+    expect(getLevelIdentity(before)).to.equal(getLevelIdentity(after));
+  });
+
+  it('distinguishes variants with different URIs', function () {
+    const a = level({ bitrate: 2149280, url: 'https://a/720.m3u8' });
+    const b = level({ bitrate: 2149280, url: 'https://b/720.m3u8' });
+    expect(getLevelIdentity(a)).to.not.equal(getLevelIdentity(b));
+  });
+
+  it('prefers STABLE-VARIANT-ID over media characteristics', function () {
+    const a = level({
+      bitrate: 2149280,
+      url: 'https://example.com/old.m3u8',
+      stableVariantId: 'tier14',
+    });
+    const b = level({
+      bitrate: 2149280,
+      url: 'https://example.com/new.m3u8',
+      stableVariantId: 'tier14',
+    });
+    expect(getLevelIdentity(a)).to.equal(getLevelIdentity(b));
+  });
+
+  it('finds the index of a level by identity and returns -1 when removed', function () {
+    const levels = [
+      level({ bitrate: 105000, url: 'https://example.com/144.m3u8' }),
+      level({ bitrate: 2149280, url: 'https://example.com/720.m3u8' }),
+      level({ bitrate: 6221600, url: 'https://example.com/1080.m3u8' }),
+    ];
+    const target = level({
+      bitrate: 2149280,
+      url: 'https://example.com/720.m3u8',
+      name: 'renamed',
+    });
+    expect(findLevelIndexByIdentity(levels, target)).to.equal(1);
+    const removed = level({
+      bitrate: 999,
+      url: 'https://example.com/gone.m3u8',
+    });
+    expect(findLevelIndexByIdentity(levels, removed)).to.equal(-1);
+    expect(findLevelIndexByIdentity(levels, null)).to.equal(-1);
+    // Also accepts a stored identity string
+    expect(findLevelIndexByIdentity(levels, getLevelIdentity(target))).to.equal(
+      1,
+    );
+    expect(findLevelIndexByIdentity(levels, '')).to.equal(-1);
+  });
+});

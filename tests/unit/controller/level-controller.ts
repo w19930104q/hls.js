@@ -1278,6 +1278,249 @@ segment-2.seg`,
       expect(loadingPlaylist).to.have.been.calledOnce;
     });
   });
+
+  describe('Level selection across multivariant playlist refreshes', function () {
+    const url = 'https://example.com/main.m3u8';
+
+    function manifestData(
+      levels: ReturnType<typeof parsedLevel>[],
+    ): ManifestLoadedData {
+      return {
+        audioTracks: [],
+        levels,
+        iframeVariants: [],
+        networkDetails: new Response('ok'),
+        sessionData: null,
+        sessionKeys: null,
+        contentSteering: null,
+        startTimeOffset: null,
+        variableList: null,
+        stats: new LoadStats(),
+        subtitles: [],
+        url,
+      };
+    }
+
+    // Three variants from the same CDN. The 720p variant keeps the same URI
+    // and bitrate across refreshes but the playlist changes its short name and
+    // reverses the order of the list.
+    function levelsBeforeRefresh() {
+      return [
+        parsedLevel({
+          bitrate: 105000,
+          name: '144',
+          url: 'https://example.com/105000.m3u8',
+          width: 256,
+          height: 144,
+        }),
+        parsedLevel({
+          bitrate: 2149280,
+          name: '720',
+          url: 'https://example.com/2149280.m3u8',
+          width: 1280,
+          height: 720,
+        }),
+        parsedLevel({
+          bitrate: 6221600,
+          name: '1080',
+          url: 'https://example.com/6221600.m3u8',
+          width: 1920,
+          height: 1080,
+        }),
+      ];
+    }
+
+    function levelsAfterRefresh() {
+      return [
+        parsedLevel({
+          bitrate: 6221600,
+          name: '1080p',
+          url: 'https://example.com/6221600.m3u8',
+          width: 1920,
+          height: 1080,
+        }),
+        // Same URI and bitrate as the old 720 variant, new short name
+        parsedLevel({
+          bitrate: 2149280,
+          name: 'HD-720',
+          url: 'https://example.com/2149280.m3u8',
+          width: 1280,
+          height: 720,
+        }),
+        parsedLevel({
+          bitrate: 105000,
+          name: '144p',
+          url: 'https://example.com/105000.m3u8',
+          width: 256,
+          height: 144,
+        }),
+      ];
+    }
+
+    function switchingEvents() {
+      return (hls.trigger as sinon.SinonSpy)
+        .getCalls()
+        .filter((call) => call.args[0] === Events.LEVEL_SWITCHING);
+    }
+
+    it('keeps the manually selected level by stable identity when the playlist is reordered and renamed (HLS5)', function () {
+      const before = levelsBeforeRefresh();
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(before),
+      );
+      const sortedBefore = hls.levels;
+      // Levels are sorted low to high; the middle variant is the 720p level
+      let middleIndex = -1;
+      for (let i = 0; i < sortedBefore.length; i++) {
+        if (sortedBefore[i].uri === 'https://example.com/2149280.m3u8') {
+          middleIndex = i;
+          break;
+        }
+      }
+      expect(middleIndex).to.equal(1);
+
+      // User locks the middle (720p) level
+      levelController.manualLevel = middleIndex;
+      expect(levelController.level).to.equal(1);
+      expect(levelController.manualLevel).to.equal(1);
+
+      // Simulate a multivariant playlist refresh: MANIFEST_LOADING resets the
+      // parsed levels, then the refreshed playlist is loaded with the order
+      // reversed and the 720p variant renamed.
+      levelController.onManifestLoading(Events.MANIFEST_LOADING, { url });
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(levelsAfterRefresh()),
+      );
+
+      const sortedAfter = hls.levels;
+      let newIndex = -1;
+      for (let i = 0; i < sortedAfter.length; i++) {
+        if (sortedAfter[i].uri === 'https://example.com/2149280.m3u8') {
+          newIndex = i;
+          break;
+        }
+      }
+      // The same 720p variant now sits at a different index (1, was 1... the
+      // reversed list puts it in the middle; assert identity regardless)
+      expect(newIndex).to.be.greaterThan(-1);
+      expect(sortedAfter[newIndex].name).to.equal('HD-720');
+      // Current level is still the same 720p variant
+      expect(levelController.level).to.equal(newIndex);
+      expect(levelController.loadLevelObj?.uri).to.equal(
+        'https://example.com/2149280.m3u8',
+      );
+      expect(levelController.loadLevelObj?.bitrate).to.equal(2149280);
+      // The manual selection query returns the same variant
+      expect(levelController.manualLevel).to.equal(newIndex);
+      // The bandwidth consumer (nextLoadLevel) sees the same selection
+      expect(levelController.nextLoadLevel).to.equal(newIndex);
+    });
+
+    it('emits a single LEVEL_SWITCHING notification for the restored level after a refresh', function () {
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(levelsBeforeRefresh()),
+      );
+      levelController.manualLevel = 1;
+      const beforeCount = switchingEvents().length;
+
+      levelController.onManifestLoading(Events.MANIFEST_LOADING, { url });
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(levelsAfterRefresh()),
+      );
+
+      const afterEvents = switchingEvents();
+      expect(afterEvents.length).to.equal(beforeCount + 1);
+      const restored = afterEvents[afterEvents.length - 1].args[1];
+      expect(restored.uri).to.equal('https://example.com/2149280.m3u8');
+    });
+
+    it('falls back to a playable level once when the selected variant is removed by the refresh', function () {
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(levelsBeforeRefresh()),
+      );
+      levelController.manualLevel = 1;
+
+      const withoutSelected = [
+        parsedLevel({
+          bitrate: 105000,
+          name: '144p',
+          url: 'https://example.com/105000.m3u8',
+          width: 256,
+          height: 144,
+        }),
+        parsedLevel({
+          bitrate: 6221600,
+          name: '1080p',
+          url: 'https://example.com/6221600.m3u8',
+          width: 1920,
+          height: 1080,
+        }),
+      ];
+
+      levelController.onManifestLoading(Events.MANIFEST_LOADING, { url });
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(withoutSelected),
+      );
+
+      // The removed variant falls back to the lowest playable level once
+      expect(levelController.level).to.equal(0);
+      expect(levelController.loadLevelObj?.uri).to.equal(
+        'https://example.com/105000.m3u8',
+      );
+      const switching = switchingEvents();
+      const fallbackCalls = switching.filter(
+        (call) => call.args[1].uri === 'https://example.com/105000.m3u8',
+      );
+      expect(fallbackCalls).to.have.lengthOf(1);
+    });
+
+    it('falls back to a playable level once when the current level is removed via removeLevel', function () {
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(levelsBeforeRefresh()),
+      );
+      levelController.manualLevel = 1;
+      const beforeCount = switchingEvents().length;
+
+      levelController.removeLevel(1);
+
+      expect(levelController.level).to.equal(0);
+      expect(levelController.manualLevel).to.equal(0);
+      const afterEvents = switchingEvents();
+      expect(afterEvents.length).to.equal(beforeCount + 1);
+      // LEVELS_UPDATED is still emitted for the remaining levels
+      const levelsUpdated = (hls.trigger as sinon.SinonSpy)
+        .getCalls()
+        .filter((call) => call.args[0] === Events.LEVELS_UPDATED);
+      expect(levelsUpdated).to.have.lengthOf(1);
+      expect(levelsUpdated[0].args[1].levels).to.have.lengthOf(2);
+    });
+
+    it('keeps automatic mode across a refresh when no manual level was selected', function () {
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(levelsBeforeRefresh()),
+      );
+      // No manual selection: the controller stays in ABR mode
+      expect(levelController.manualLevel).to.equal(-1);
+
+      levelController.onManifestLoading(Events.MANIFEST_LOADING, { url });
+      levelController.onManifestLoaded(
+        Events.MANIFEST_LOADED,
+        manifestData(levelsAfterRefresh()),
+      );
+
+      // Still in automatic mode and no LEVEL_SWITCHING was forced
+      expect(levelController.manualLevel).to.equal(-1);
+      expect(switchingEvents()).to.have.lengthOf(0);
+    });
+  });
 });
 
 describe('LevelController - nextLoadLevel', function () {

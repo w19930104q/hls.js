@@ -10,7 +10,11 @@ import {
   getCodecCompatibleName,
   videoCodecPreferenceValue,
 } from '../utils/codecs';
-import { reassignFragmentLevelIndexes } from '../utils/level-helper';
+import {
+  findLevelIndexByIdentity,
+  getLevelIdentity,
+  reassignFragmentLevelIndexes,
+} from '../utils/level-helper';
 import { getUnsupportedResult } from '../utils/mediacapabilities-helper';
 import { stringify } from '../utils/safe-json-stringify';
 import type ContentSteeringController from './content-steering-controller';
@@ -36,6 +40,11 @@ export default class LevelController extends BasePlaylistController {
   private currentLevel: Level | null = null;
   private currentLevelIndex: number = -1;
   private manualLevelIndex: number = -1;
+  // Stable identities of the manually and currently selected levels. Levels
+  // are re-created and re-sorted when the multivariant playlist is refreshed,
+  // so array indexes cannot be used to keep the selection across refreshes.
+  private manualLevelIdentity: string | null = null;
+  private currentLevelIdentity: string | null = null;
   private steering: ContentSteeringController | null;
   private lastABRSwitchTime: number = -1;
 
@@ -75,6 +84,8 @@ export default class LevelController extends BasePlaylistController {
   public destroy() {
     this._unregisterListeners();
     this.steering = null;
+    this.manualLevelIdentity = null;
+    this.currentLevelIdentity = null;
     this.resetLevels();
     super.destroy();
   }
@@ -100,6 +111,11 @@ export default class LevelController extends BasePlaylistController {
     this._maxAutoLevel = -1;
 
     this._iframeVariants = [];
+    // Note: manualLevelIdentity and currentLevelIdentity are intentionally not
+    // cleared here. resetLevels() runs on every MANIFEST_LOADING, including
+    // multivariant playlist refreshes of the same source, and the manual/current
+    // selection must survive them. They are only cleared on destroy() or when
+    // the selected variant is gone from the refreshed playlist.
   }
 
   private onManifestLoading(
@@ -362,6 +378,11 @@ export default class LevelController extends BasePlaylistController {
     );
     this._iframeVariants = iframeVariants;
 
+    // Re-apply the manual/current selection based on stable level identities.
+    // A multivariant playlist refresh can re-order variants and change their
+    // display names, so indexes from the previous playlist cannot be trusted.
+    this.restoreSelection(levels);
+
     // Audio is only alternate if manifest include a URI along with the audio group tag,
     // and this is not an audio-only stream where levels contain audio-only
     const audioOnly = audioCodecFound && !videoCodecFound;
@@ -440,6 +461,7 @@ export default class LevelController extends BasePlaylistController {
     const pathwayId = level.attrs['PATHWAY-ID'];
     this.currentLevelIndex = newLevel;
     this.currentLevel = level;
+    this.currentLevelIdentity = getLevelIdentity(level);
 
     if (
       lastLevelIndex === newLevel &&
@@ -513,7 +535,14 @@ export default class LevelController extends BasePlaylistController {
     }
 
     if (newLevel !== -1) {
+      const manualLevel = this._levels[newLevel];
+      if (manualLevel) {
+        this.manualLevelIdentity = getLevelIdentity(manualLevel);
+      }
       this.level = newLevel;
+    } else {
+      // Switching back to automatic level selection
+      this.manualLevelIdentity = null;
     }
   }
 
@@ -713,6 +742,10 @@ export default class LevelController extends BasePlaylistController {
     if (this._levels.length === 1) {
       return;
     }
+    const removedLevel = this._levels[levelIndex];
+    const removedIdentity = removedLevel
+      ? getLevelIdentity(removedLevel)
+      : null;
     const levels = this._levels.filter((level, index) => {
       if (index !== levelIndex) {
         return true;
@@ -720,29 +753,118 @@ export default class LevelController extends BasePlaylistController {
       if (this.steering) {
         this.steering.removeLevel(level);
       }
-      if (level === this.currentLevel) {
-        this.currentLevel = null;
-        this.currentLevelIndex = -1;
-        if (level.details) {
-          level.details.fragments.forEach((f) => (f.level = -1));
-        }
+      if (level.details) {
+        level.details.fragments.forEach((f) => (f.level = -1));
       }
       return false;
     });
     reassignFragmentLevelIndexes(levels);
     this._levels = levels;
-    if (this.currentLevelIndex > -1 && this.currentLevel?.details) {
-      this.currentLevelIndex = this.currentLevel.details.fragments[0].level;
+
+    const removedCurrentLevel = removedLevel === this.currentLevel;
+    const removedManualLevel =
+      this.manualLevelIdentity !== null &&
+      removedIdentity === this.manualLevelIdentity;
+
+    if (removedCurrentLevel) {
+      // Fall back to a playable level. selectFallbackLevel goes through the
+      // level setter, emitting a single LEVEL_SWITCHING notification.
+      this.currentLevelIdentity = null;
+      this.selectFallbackLevel(levels);
+    } else if (this.currentLevel) {
+      // Keep pointing at the same variant at its new position in the array
+      this.currentLevelIndex = levels.indexOf(this.currentLevel);
+      if (this.currentLevelIndex > -1) {
+        this.currentLevelIdentity = getLevelIdentity(
+          this.currentLevel as Level,
+        );
+      }
     }
-    if (this.manualLevelIndex > -1) {
+
+    if (removedManualLevel) {
+      if (this.currentLevelIndex > -1) {
+        // Keep the manual selection on the level we fell back to
+        this.manualLevelIndex = this.currentLevelIndex;
+        this.manualLevelIdentity = this.currentLevelIdentity;
+      } else {
+        // Return to automatic level selection
+        this.manualLevelIndex = -1;
+        this.manualLevelIdentity = null;
+      }
+    } else if (this.manualLevelIndex > -1 && this.currentLevelIndex > -1) {
       this.manualLevelIndex = this.currentLevelIndex;
     }
+
     const maxLevel = levels.length - 1;
     this._firstLevel = Math.min(this._firstLevel, maxLevel);
     if (this._startLevel) {
       this._startLevel = Math.min(this._startLevel, maxLevel);
     }
     this.hls.trigger(Events.LEVELS_UPDATED, { levels });
+  }
+
+  /**
+   * Re-applies the current and manual level selection after a multivariant
+   * playlist refresh by matching the stored stable level identities against
+   * the refreshed levels array. When the previously selected variant has been
+   * removed from the playlist, falls back to a playable level (or automatic
+   * selection) and emits at most one LEVEL_SWITCHING notification.
+   */
+  private restoreSelection(levels: Level[]) {
+    const hadManualSelection = this.manualLevelIdentity !== null;
+    const hadCurrentSelection = this.currentLevelIdentity !== null;
+    if (!hadManualSelection && !hadCurrentSelection) {
+      return;
+    }
+
+    const manualIndex = hadManualSelection
+      ? findLevelIndexByIdentity(levels, this.manualLevelIdentity)
+      : -1;
+    const currentIndex = hadCurrentSelection
+      ? findLevelIndexByIdentity(levels, this.currentLevelIdentity)
+      : -1;
+
+    if (manualIndex > -1) {
+      // The manually selected variant is still available: re-select it at its
+      // new index. Its display name and position may have changed, but its URI
+      // and media characteristics are the same. The level setter keeps
+      // currentLevelIdentity in sync and emits a single LEVEL_SWITCHING event
+      // (the refresh created new Level instances, so the level object changed).
+      this.manualLevelIndex = manualIndex;
+      this.level = manualIndex;
+      return;
+    }
+
+    // The manually selected variant is gone from the playlist: return to
+    // automatic level selection
+    this.manualLevelIndex = -1;
+    this.manualLevelIdentity = null;
+
+    if (currentIndex > -1) {
+      // The currently playing variant survived even though the manual one did
+      // not; keep playback on it (at its new index) and let ABR take over.
+      this.level = currentIndex;
+      return;
+    }
+
+    // Neither the manual nor the current variant is still in the playlist.
+    this.currentLevelIdentity = null;
+    this.selectFallbackLevel(levels);
+  }
+
+  /**
+   * Selects a playable level after the current level has been removed from the
+   * playlist. Emits a single LEVEL_SWITCHING event for the fallback level so
+   * that playlist consumers (stream controller, bandwidth estimator) observe
+   * one consistent selection.
+   */
+  private selectFallbackLevel(levels: Level[]) {
+    if (levels.length === 0) {
+      return;
+    }
+    // The lowest available variant is always a playable fallback.
+    this.log('Selected level removed from playlist; falling back to level 0');
+    this.level = 0;
   }
 
   private onLevelsUpdated(
