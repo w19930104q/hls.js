@@ -879,6 +879,8 @@ When set to a value greater than `1`, the latency-controller will adjust `video.
 
 The default value is `1`, which disables playback rate adjustment. Set `maxLiveSyncPlaybackRate` to a value greater than `1` to enable playback rate adjustment at the live edge.
 
+Playback rate is adjusted only while the media element is playing. Pausing and seeking do not participate in catch-up: an elevated catch-up rate is restored to `1` when playback is paused, no rate changes are made while a seek is in progress, and after a seek completes the catch-up rate is re-evaluated from the new playback position against the current live edge.
+
 ### `liveMaxUnchangedPlaylistRefresh`
 
 (default: `Infinity`)

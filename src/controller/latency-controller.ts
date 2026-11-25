@@ -177,11 +177,15 @@ export default class LatencyController implements ComponentAPI {
   ) {
     this.media = data.media;
     this.media.addEventListener('timeupdate', this.onTimeupdate);
+    this.media.addEventListener('pause', this.onPause);
+    this.media.addEventListener('seeked', this.onSeeked);
   }
 
   private onMediaDetaching() {
     if (this.media) {
       this.media.removeEventListener('timeupdate', this.onTimeupdate);
+      this.media.removeEventListener('pause', this.onPause);
+      this.media.removeEventListener('seeked', this.onSeeked);
       this.media = null;
     }
   }
@@ -237,6 +241,28 @@ export default class LatencyController implements ComponentAPI {
     }
   }
 
+  private onPause = () => {
+    const { hls, media } = this;
+    // Restore normal playback speed when playback is paused so that resuming
+    // does not sprint from the position where playback was paused.
+    // Only reset rates that this controller applied for live latency catch-up,
+    // leaving externally configured rates untouched.
+    if (
+      media &&
+      hls &&
+      media.playbackRate > 1 &&
+      media.playbackRate <= hls.config.maxLiveSyncPlaybackRate
+    ) {
+      this.changeMediaPlaybackRate(media, 1);
+    }
+  };
+
+  private onSeeked = () => {
+    // Re-evaluate catch-up against the live edge from the new playback
+    // position once a seek completes. No rate changes are made while seeking.
+    this.onTimeupdate();
+  };
+
   private onTimeupdate = () => {
     const { media } = this;
     const levelDetails = this.levelDetails;
@@ -252,7 +278,13 @@ export default class LatencyController implements ComponentAPI {
     }
     this._latency = latency;
 
-    // Adapt playbackRate to meet target latency in low-latency mode
+    // Adapt playbackRate to meet target latency in low-latency mode.
+    // Catch-up only advances while playing live: pausing, seeking, and waiting
+    // for a buffer do not participate in catch-up and must not change the rate.
+    if (media.paused || media.seeking) {
+      return;
+    }
+
     const { lowLatencyMode, maxLiveSyncPlaybackRate } = config;
     if (
       !lowLatencyMode ||

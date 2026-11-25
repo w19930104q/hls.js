@@ -24,9 +24,21 @@ describe('LatencyController', function () {
     currentTime: number;
     playbackRate: number;
     buffered: TimeRanges;
+    paused: boolean;
+    seeking: boolean;
+    addEventListener(
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+    ): void;
+    removeEventListener(
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+    ): void;
+    dispatchEvent(event: Event): boolean;
   };
   let mockTimeRanges: [number, number][] = [];
   let levelDetails: TestLevelDetails;
+  let emit: (type: string) => void;
 
   beforeEach(function () {
     hls = new Hls({});
@@ -60,10 +72,16 @@ describe('LatencyController', function () {
       );
     });
     let currentTime = 0;
+    const eventListeners: Record<
+      string,
+      Set<EventListenerOrEventListenerObject>
+    > = {};
     // @ts-ignore
     media = latencyController['media'] = {
       currentTime: 0,
       playbackRate: 1,
+      paused: false,
+      seeking: false,
       buffered: {
         get length() {
           return mockTimeRanges.length;
@@ -75,7 +93,31 @@ describe('LatencyController', function () {
           return mockTimeRanges[index][1];
         },
       },
+      addEventListener(type, listener) {
+        if (!eventListeners[type]) {
+          eventListeners[type] = new Set();
+        }
+        eventListeners[type].add(listener);
+      },
+      removeEventListener(type, listener) {
+        eventListeners[type]?.delete(listener);
+      },
+      dispatchEvent(event: Event) {
+        eventListeners[event.type]?.forEach((listener) => {
+          if (typeof listener === 'function') {
+            listener.call(media, event);
+          } else {
+            listener.handleEvent(event);
+          }
+        });
+        return true;
+      },
     };
+    // Register the media listeners that onMediaAttached would register
+    media.addEventListener('timeupdate', latencyController['onTimeupdate']);
+    media.addEventListener('pause', latencyController['onPause']);
+    media.addEventListener('seeked', latencyController['onSeeked']);
+    emit = (type: string) => media.dispatchEvent(new Event(type));
     const currentTimeStub = sinon.stub(media, 'currentTime');
     currentTimeStub.get(() => currentTime);
     currentTimeStub.set((value: number) => {
@@ -323,6 +365,93 @@ describe('LatencyController', function () {
       expect(latencyController.latency).to.equal(25);
       latencyController['onManifestLoading']();
       expect(latencyController.latency).to.equal(0);
+    });
+
+    it('resets an elevated catch-up rate when playback is paused', function () {
+      levelDetails.edge = 12;
+      mockTimeRanges = [[0, 12]];
+      levelDetails.holdBack = 6;
+      // Catch-up rate is applied while playing
+      media.currentTime = 4;
+      expect(media.playbackRate).to.be.greaterThan(1);
+      // Pausing restores normal playback speed so resuming does not sprint
+      media.paused = true;
+      emit('pause');
+      expect(media.playbackRate).to.equal(1);
+    });
+
+    it('does not change the playback rate while paused or seeking', function () {
+      levelDetails.edge = 100;
+      mockTimeRanges = [[0, 100]];
+      hls.config.liveSyncDuration = 2;
+
+      // A timeupdate arriving while paused does not adjust the rate
+      media.paused = true;
+      media.currentTime = 90;
+      expect(media.playbackRate).to.equal(1);
+      media.playbackRate = 0.8;
+      media.currentTime = 89;
+      expect(media.playbackRate).to.equal(0.8);
+      media.playbackRate = 1;
+
+      // A timeupdate arriving while seeking does not adjust the rate
+      media.paused = false;
+      media.seeking = true;
+      media.currentTime = 80;
+      expect(media.playbackRate).to.equal(1);
+      media.playbackRate = 1.4;
+      media.currentTime = 81;
+      expect(media.playbackRate).to.equal(1.4);
+      media.playbackRate = 1;
+    });
+
+    it('leaves playback rates outside of its catch-up range untouched on pause', function () {
+      media.playbackRate = 3;
+      media.paused = true;
+      emit('pause');
+      expect(media.playbackRate).to.equal(3);
+    });
+
+    it('re-evaluates catch-up from the new position against the live edge after a seek (HLS7)', function () {
+      levelDetails.edge = 100;
+      mockTimeRanges = [[0, 100]];
+      hls.config.liveSyncDuration = 2;
+
+      // Playback starts at 94s with the live edge at 100s (6s latency)
+      media.currentTime = 94;
+      expect(latencyController.latency).to.equal(6);
+      expect(media.playbackRate).to.be.greaterThan(1);
+      const catchUpRate = media.playbackRate;
+
+      // Pause for 3s: the rate returns to 1.0 and stays there while paused
+      media.paused = true;
+      emit('pause');
+      expect(media.playbackRate).to.equal(1);
+      media.currentTime = 91;
+      expect(media.playbackRate).to.equal(1);
+
+      // Resume, then seek back to 80s: no rate change while seeking
+      media.paused = false;
+      media.seeking = true;
+      media.currentTime = 80;
+      expect(media.playbackRate).to.equal(1);
+
+      // Seek completes at 80s: far from the live edge, playback stays at 1x
+      media.seeking = false;
+      emit('seeked');
+      expect(media.playbackRate).to.equal(1);
+
+      // Jump forward to 97s while seeking: the rate still must not change
+      media.seeking = true;
+      media.currentTime = 97;
+      expect(media.playbackRate).to.equal(1);
+
+      // Once the seek completes, catch-up is recomputed from the new position
+      media.seeking = false;
+      emit('seeked');
+      expect(media.playbackRate).to.be.greaterThan(1);
+      // 1s from target latency at 97s is a smaller gap than 4s at 94s
+      expect(media.playbackRate).to.be.lessThan(catchUpRate);
     });
   });
 });
