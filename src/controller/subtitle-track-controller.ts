@@ -254,7 +254,11 @@ class SubtitleTrackController extends BasePlaylistController {
     }
     const subtitleGroups = levelInfo.subtitleGroups || null;
     const currentGroups = this.groupIds;
-    let currentTrack = this.currentTrack;
+    // Keep a reference to the selected track so that an explicit user
+    // selection (or the default track) can be carried over to an
+    // equivalent rendition when the manifest refresh changes group-IDs.
+    const previousTrack = this.currentTrack;
+    let currentTrack = previousTrack;
     if (
       !subtitleGroups ||
       currentGroups?.length !== subtitleGroups?.length ||
@@ -323,6 +327,13 @@ class SubtitleTrackController extends BasePlaylistController {
       // Select initial track
       let trackId = this.findTrackId(currentTrack);
       if (trackId === -1 && currentTrack) {
+        // No equivalent of the previously selected (or preferred) track
+        // exists in the new group(s). Fall back to the new default track and
+        // notify consumers of this single effective change.
+        currentTrack = null;
+        if (subtitleTracks.some((track) => track.default)) {
+          this.selectDefaultTrack = true;
+        }
         trackId = this.findTrackId(null);
       }
 
@@ -357,6 +368,35 @@ class SubtitleTrackController extends BasePlaylistController {
       }
     }
     if (currentTrack) {
+      // The group-ID is expected to change on a manifest refresh. Find the
+      // equivalent rendition in the new group by its identity (name and
+      // language) rather than its group, so an explicit user selection or the
+      // default track is carried over instead of resetting to a different
+      // (e.g. default English) rendition.
+      const { name, lang, assocLang, characteristics } = currentTrack;
+      // 1. Same name and language (new group allowed). This matches the parsed
+      //    MediaPlaylist fields, so it works even when the raw attributes do
+      //    not carry LANGUAGE / NAME.
+      const equivalentOption = { name, lang, assocLang, characteristics };
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
+        if (matchesOption(equivalentOption, track)) {
+          return i;
+        }
+      }
+      // 2. Same language but a renamed rendition (e.g. "zh-main" ->
+      //    "zh-main-v2"): the NAME differs, so match on language and the
+      //    other media attributes.
+      const renamedOption = { lang, assocLang, characteristics };
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
+        if (matchesOption(renamedOption, track)) {
+          return i;
+        }
+      }
+      // 3. Fall back to comparing the raw media attributes. Only the listed
+      //    identity attributes are compared, so GROUP-ID / NAME differences
+      //    between refreshes do not prevent a match.
       for (let i = 0; i < tracks.length; i++) {
         const track = tracks[i];
         if (
@@ -376,6 +416,14 @@ class SubtitleTrackController extends BasePlaylistController {
             'LANGUAGE',
           ])
         ) {
+          return i;
+        }
+      }
+      // 4. Last resort: same language only, using the parsed lang field.
+      const langOnlyOption = { lang, assocLang };
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
+        if (matchesOption(langOnlyOption, track)) {
           return i;
         }
       }

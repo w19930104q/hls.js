@@ -555,6 +555,232 @@ describe('AudioTrackController', function () {
     });
   });
 
+  describe('audio track group-ID refresh (HLS6)', function () {
+    const makeAudioTrack = (
+      name: string,
+      lang: string,
+      groupId: string,
+      isDefault: boolean,
+    ): MediaPlaylist => ({
+      attrs: new AttrList({
+        'GROUP-ID': groupId,
+        NAME: name,
+        LANGUAGE: lang,
+        DEFAULT: isDefault ? 'YES' : 'NO',
+        AUTOSELECT: 'NO',
+      }) as MediaAttributes,
+      bitrate: 0,
+      autoselect: false,
+      default: isDefault,
+      forced: false,
+      groupId,
+      id: 0,
+      name,
+      lang,
+      type: 'AUDIO',
+      url: `${name}.m3u8`,
+    });
+
+    it('maps an explicit user selection to the equivalent track in the new group and emits a single change', function () {
+      const zhMain = makeAudioTrack('zh-main', 'zh', 'old-group', false);
+      const enMain = makeAudioTrack('en-main', 'en', 'old-group', true);
+      const enMainV2 = makeAudioTrack('en-main-v2', 'en', 'new-group', true);
+      const zhMainV2 = makeAudioTrack('zh-main-v2', 'zh', 'new-group', false);
+
+      hls.levelController = {
+        levels: [{ audioGroups: ['old-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [zhMain, enMain],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+
+      // User explicitly selects the Chinese audio track
+      audioTrackController.audioTrack = 0;
+      expect(audioTrackController.audioTracks[0]).to.equal(zhMain);
+
+      const updatedSpy = sinon.spy();
+      const switchingSpy = sinon.spy();
+      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, updatedSpy);
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, switchingSpy);
+
+      // Manifest refresh: old group removed, equivalent tracks in new group
+      hls.levelController = {
+        levels: [{ audioGroups: ['new-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [enMainV2, zhMainV2],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+
+      // The explicit selection is preserved on the equivalent track
+      const selectedTrack =
+        audioTrackController.audioTracks[audioTrackController.audioTrack];
+      expect(selectedTrack, 'audioTrack query points at zh-main-v2').to.equal(
+        zhMainV2,
+      );
+      expect(
+        audioTrackController.audioTracks.indexOf(zhMainV2),
+        'both queries resolve to the same new-group track',
+      ).to.equal(audioTrackController.audioTrack);
+
+      // Consumers receive the updated list once and one effective switch (zh),
+      // never a transient switch to the English default
+      expect(updatedSpy).to.have.been.calledOnce;
+      expect(switchingSpy).to.have.been.calledOnce;
+      expect(switchingSpy).to.have.been.calledWith(
+        Events.AUDIO_TRACK_SWITCHING,
+        sinon.match({ name: 'zh-main-v2', lang: 'zh', groupId: 'new-group' }),
+      );
+    });
+
+    it('keeps the default-track consumer on the equivalent track when group-IDs change', function () {
+      const zhMain = makeAudioTrack('zh-main', 'zh', 'old-group', true);
+      const enMain = makeAudioTrack('en-main', 'en', 'old-group', false);
+      const enMainV2 = makeAudioTrack('en-main-v2', 'en', 'new-group', true);
+      const zhMainV2 = makeAudioTrack('zh-main-v2', 'zh', 'new-group', false);
+
+      hls.levelController = {
+        levels: [{ audioGroups: ['old-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [zhMain, enMain],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+      // No user interaction: the default Chinese track is selected
+      expect(audioTrackController.audioTracks[audioTrackController.audioTrack])
+        .to.equal(zhMain);
+
+      const switchingSpy = sinon.spy();
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, switchingSpy);
+
+      // Refresh makes English the new default; an equivalent Chinese track exists
+      hls.levelController = {
+        levels: [{ audioGroups: ['new-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [enMainV2, zhMainV2],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+
+      const selectedTrack =
+        audioTrackController.audioTracks[audioTrackController.audioTrack];
+      expect(selectedTrack, 'default consumer stays on Chinese equivalent')
+        .to.equal(zhMainV2);
+      expect(switchingSpy).to.have.been.calledOnce;
+      expect(switchingSpy).to.have.been.calledWith(
+        Events.AUDIO_TRACK_SWITCHING,
+        sinon.match({ name: 'zh-main-v2', lang: 'zh' }),
+      );
+    });
+
+    it('falls back to the new default track and notifies once when no equivalent track exists', function () {
+      const zhMain = makeAudioTrack('zh-main', 'zh', 'old-group', false);
+      const enMain = makeAudioTrack('en-main', 'en', 'old-group', true);
+      const frMainV2 = makeAudioTrack('fr-main-v2', 'fr', 'new-group', true);
+
+      hls.levelController = {
+        levels: [{ audioGroups: ['old-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [zhMain, enMain],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+      audioTrackController.audioTrack = 0;
+
+      const switchingSpy = sinon.spy();
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, switchingSpy);
+
+      // Refresh: the new group has no Chinese equivalent
+      hls.levelController = {
+        levels: [{ audioGroups: ['new-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [frMainV2],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+
+      const selectedTrack =
+        audioTrackController.audioTracks[audioTrackController.audioTrack];
+      expect(selectedTrack, 'falls back to the only new-group default track')
+        .to.equal(frMainV2);
+      expect(switchingSpy, 'single fallback notification').to.have.been
+        .calledOnce;
+      expect(switchingSpy).to.have.been.calledWith(
+        Events.AUDIO_TRACK_SWITCHING,
+        sinon.match({ name: 'fr-main-v2', lang: 'fr' }),
+      );
+    });
+
+    it('preserves the selection across a renamed group refresh when attributes lack language info', function () {
+      // Renditions whose raw attrs do not repeat LANGUAGE / NAME: the language
+      // is only available on the parsed MediaPlaylist fields.
+      const makeBareTrack = (
+        name: string,
+        lang: string,
+        groupId: string,
+        isDefault: boolean,
+      ): MediaPlaylist => ({
+        attrs: new AttrList({}) as MediaAttributes,
+        bitrate: 0,
+        autoselect: false,
+        default: isDefault,
+        forced: false,
+        groupId,
+        id: 0,
+        name,
+        lang,
+        type: 'AUDIO',
+        url: `${name}.m3u8`,
+      });
+      const zhMain = makeBareTrack('zh-main', 'zh', 'old-group', false);
+      const enMain = makeBareTrack('en-main', 'en', 'old-group', true);
+      const enMainV2 = makeBareTrack(
+        'en-main-v2',
+        'en',
+        'new-group',
+        true,
+      );
+      const zhMainV2 = makeBareTrack(
+        'zh-main-v2',
+        'zh',
+        'new-group',
+        false,
+      );
+
+      hls.levelController = {
+        levels: [{ audioGroups: ['old-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [zhMain, enMain],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+      audioTrackController.audioTrack = 0;
+
+      const switchingSpy = sinon.spy();
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, switchingSpy);
+
+      hls.levelController = {
+        levels: [{ audioGroups: ['new-group'] }],
+      };
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [enMainV2, zhMainV2],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, { level: 0 });
+
+      // The Chinese selection must follow the language, not fall to the
+      // English default even though the name and group both changed.
+      const selectedTrack =
+        audioTrackController.audioTracks[audioTrackController.audioTrack];
+      expect(selectedTrack).to.equal(zhMainV2);
+      expect(switchingSpy).to.have.been.calledOnce;
+      expect(switchingSpy).to.have.been.calledWith(
+        Events.AUDIO_TRACK_SWITCHING,
+        sinon.match({ name: 'zh-main-v2', lang: 'zh' }),
+      );
+    });
+  });
+
   describe('audioTrack with flushImmediate', function () {
     beforeEach(function () {
       hls.levelController = {

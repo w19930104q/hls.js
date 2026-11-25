@@ -737,4 +737,340 @@ describe('SubtitleTrackController', function () {
       expect(loadCurrentTrackSpy).to.have.been.calledOnce;
     });
   });
+
+  describe('subtitle track group-ID refresh', function () {
+    const makeSubtitleTrack = (
+      name: string,
+      lang: string,
+      groupId: string,
+      isDefault: boolean,
+    ): MediaPlaylist => ({
+      attrs: new AttrList({
+        'GROUP-ID': groupId,
+        NAME: name,
+        LANGUAGE: lang,
+        DEFAULT: isDefault ? 'YES' : 'NO',
+        AUTOSELECT: 'YES',
+      }) as MediaAttributes,
+      autoselect: true,
+      bitrate: 0,
+      default: isDefault,
+      forced: false,
+      id: 0,
+      groupId,
+      lang,
+      name,
+      type: 'SUBTITLES',
+      url: `${name}.vtt`,
+      textCodec: 'webvtt',
+    });
+
+    it('maps an explicit user selection to the equivalent track in the new group and emits a single change', function () {
+      const zhMain = makeSubtitleTrack('zh-main', 'zh', 'old-group', false);
+      const enMain = makeSubtitleTrack('en-main', 'en', 'old-group', true);
+      const enMainV2 = makeSubtitleTrack(
+        'en-main-v2',
+        'en',
+        'new-group',
+        true,
+      );
+      const zhMainV2 = makeSubtitleTrack(
+        'zh-main-v2',
+        'zh',
+        'new-group',
+        false,
+      );
+
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['old-group'] }],
+      };
+      hls.trigger(Events.MANIFEST_PARSED, {
+        subtitleTracks: [zhMain, enMain],
+        levels: [],
+        iframeVariants: [],
+        audioTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+      switchLevel();
+
+      // User explicitly selects the Chinese subtitle track
+      subtitleTrackController.subtitleTrack = 0;
+      expect(subtitleTrackController.subtitleTracks[0]).to.equal(zhMain);
+
+      const updatedSpy = sandbox.spy();
+      const switchSpy = sandbox.spy();
+      hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, updatedSpy);
+      hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, switchSpy);
+
+      // Manifest refresh: old group removed, equivalent tracks in new group
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['new-group'] }],
+      };
+      hls.trigger(Events.MANIFEST_PARSED, {
+        subtitleTracks: [enMainV2, zhMainV2],
+        levels: [],
+        iframeVariants: [],
+        audioTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+      switchLevel();
+
+      const selectedTrack =
+        subtitleTrackController.subtitleTracks[
+          subtitleTrackController.subtitleTrack
+        ];
+      expect(
+        selectedTrack,
+        'subtitleTrack query points at zh-main-v2',
+      ).to.equal(zhMainV2);
+      expect(
+        subtitleTrackController.subtitleTracks.indexOf(zhMainV2),
+        'both queries resolve to the same new-group track',
+      ).to.equal(subtitleTrackController.subtitleTrack);
+
+      expect(updatedSpy).to.have.been.calledOnce;
+      expect(switchSpy).to.have.been.calledOnce;
+      expect(switchSpy).to.have.been.calledWith(
+        Events.SUBTITLE_TRACK_SWITCH,
+        sinon.match({
+          name: 'zh-main-v2',
+          groupId: 'new-group',
+        }),
+      );
+    });
+
+    it('keeps the default-track consumer on the equivalent track when group-IDs change', function () {
+      const zhMain = makeSubtitleTrack('zh-main', 'zh', 'old-group', true);
+      const enMain = makeSubtitleTrack('en-main', 'en', 'old-group', false);
+      const enMainV2 = makeSubtitleTrack(
+        'en-main-v2',
+        'en',
+        'new-group',
+        true,
+      );
+      const zhMainV2 = makeSubtitleTrack(
+        'zh-main-v2',
+        'zh',
+        'new-group',
+        false,
+      );
+
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['old-group'] }],
+      };
+      hls.trigger(Events.MANIFEST_PARSED, {
+        subtitleTracks: [zhMain, enMain],
+        levels: [],
+        iframeVariants: [],
+        audioTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+      switchLevel();
+      expect(
+        subtitleTrackController.subtitleTracks[
+          subtitleTrackController.subtitleTrack
+        ],
+      ).to.equal(zhMain);
+
+      const switchSpy = sandbox.spy();
+      hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, switchSpy);
+
+      // Refresh makes English the new default; an equivalent Chinese track exists
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['new-group'] }],
+      };
+      hls.trigger(Events.MANIFEST_PARSED, {
+        subtitleTracks: [enMainV2, zhMainV2],
+        levels: [],
+        iframeVariants: [],
+        audioTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+      switchLevel();
+
+      const selectedTrack =
+        subtitleTrackController.subtitleTracks[
+          subtitleTrackController.subtitleTrack
+        ];
+      expect(selectedTrack, 'default consumer stays on Chinese equivalent')
+        .to.equal(zhMainV2);
+      expect(switchSpy).to.have.been.calledOnce;
+      expect(switchSpy).to.have.been.calledWith(
+        Events.SUBTITLE_TRACK_SWITCH,
+        sinon.match({ name: 'zh-main-v2' }),
+      );
+    });
+
+    it('falls back to the new default track and notifies once when no equivalent track exists', function () {
+      const zhMain = makeSubtitleTrack('zh-main', 'zh', 'old-group', false);
+      const enMain = makeSubtitleTrack('en-main', 'en', 'old-group', true);
+      const frMainV2 = makeSubtitleTrack(
+        'fr-main-v2',
+        'fr',
+        'new-group',
+        true,
+      );
+
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['old-group'] }],
+      };
+      hls.trigger(Events.MANIFEST_PARSED, {
+        subtitleTracks: [zhMain, enMain],
+        levels: [],
+        iframeVariants: [],
+        audioTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+      switchLevel();
+      subtitleTrackController.subtitleTrack = 0;
+
+      const switchSpy = sandbox.spy();
+      hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, switchSpy);
+
+      // Refresh: the new group has no Chinese equivalent
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['new-group'] }],
+      };
+      hls.trigger(Events.MANIFEST_PARSED, {
+        subtitleTracks: [frMainV2],
+        levels: [],
+        iframeVariants: [],
+        audioTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+      switchLevel();
+
+      const selectedTrack =
+        subtitleTrackController.subtitleTracks[
+          subtitleTrackController.subtitleTrack
+        ];
+      expect(selectedTrack, 'falls back to the only new-group default track')
+        .to.equal(frMainV2);
+      expect(switchSpy, 'single fallback notification').to.have.been
+        .calledOnce;
+      expect(switchSpy).to.have.been.calledWith(
+        Events.SUBTITLE_TRACK_SWITCH,
+        sinon.match({ name: 'fr-main-v2' }),
+      );
+    });
+
+    it('preserves the selection across a renamed group refresh when attributes lack language info', function () {
+      const makeBareTrack = (
+        name: string,
+        lang: string,
+        groupId: string,
+        isDefault: boolean,
+      ): MediaPlaylist => ({
+        attrs: new AttrList({}) as MediaAttributes,
+        autoselect: true,
+        bitrate: 0,
+        default: isDefault,
+        forced: false,
+        id: 0,
+        groupId,
+        lang,
+        name,
+        type: 'SUBTITLES',
+        url: `${name}.vtt`,
+        textCodec: 'webvtt',
+      });
+      const manifestData = (subtitleTracks: MediaPlaylist[]) => ({
+        subtitleTracks,
+        levels: [],
+        iframeVariants: [],
+        audioTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+
+      const zhMain = makeBareTrack('zh-main', 'zh', 'old-group', false);
+      const enMain = makeBareTrack('en-main', 'en', 'old-group', true);
+      const enMainV2 = makeBareTrack(
+        'en-main-v2',
+        'en',
+        'new-group',
+        true,
+      );
+      const zhMainV2 = makeBareTrack(
+        'zh-main-v2',
+        'zh',
+        'new-group',
+        false,
+      );
+
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['old-group'] }],
+      };
+      hls.trigger(
+        Events.MANIFEST_PARSED,
+        manifestData([zhMain, enMain]),
+      );
+      switchLevel();
+      subtitleTrackController.subtitleTrack = 0;
+
+      const switchSpy = sandbox.spy();
+      hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, switchSpy);
+
+      hls.levelController = {
+        levels: [{ subtitleGroups: ['new-group'] }],
+      };
+      hls.trigger(
+        Events.MANIFEST_PARSED,
+        manifestData([enMainV2, zhMainV2]),
+      );
+      switchLevel();
+
+      const selectedTrack =
+        subtitleTrackController.subtitleTracks[
+          subtitleTrackController.subtitleTrack
+        ];
+      expect(selectedTrack).to.equal(zhMainV2);
+      expect(switchSpy).to.have.been.calledOnce;
+      expect(switchSpy).to.have.been.calledWith(
+        Events.SUBTITLE_TRACK_SWITCH,
+        sinon.match({ name: 'zh-main-v2' }),
+      );
+    });
+  });
 });

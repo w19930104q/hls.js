@@ -132,7 +132,11 @@ class AudioTrackController extends BasePlaylistController {
     }
     const audioGroups = levelInfo.audioGroups || null;
     const currentGroups = this.groupIds;
-    let currentTrack = this.currentTrack;
+    // Keep a reference to the selected track so that an explicit user
+    // selection (or the default track) can be carried over to an
+    // equivalent rendition when the manifest refresh changes group-IDs.
+    const previousTrack = this.currentTrack;
+    let currentTrack = previousTrack;
     if (
       !audioGroups ||
       currentGroups?.length !== audioGroups?.length ||
@@ -157,7 +161,7 @@ class AudioTrackController extends BasePlaylistController {
         audioTracks.forEach((track, i) => {
           track.id = i;
         });
-      } else if (!currentTrack && !this.tracksInGroup.length) {
+      } else if (!previousTrack && !this.tracksInGroup.length) {
         // Do not dispatch AUDIO_TRACKS_UPDATED when there were and are no tracks
         return;
       }
@@ -182,6 +186,13 @@ class AudioTrackController extends BasePlaylistController {
       // Select initial track
       let trackId = this.findTrackId(currentTrack);
       if (trackId === -1 && currentTrack) {
+        // No equivalent of the previously selected (or preferred) track
+        // exists in the new group(s). Fall back to the new default track and
+        // notify consumers of this single effective change.
+        currentTrack = null;
+        if (audioTracks.some((track) => track.default)) {
+          this.selectDefaultTrack = true;
+        }
         trackId = this.findTrackId(null);
       }
 
@@ -375,20 +386,43 @@ class AudioTrackController extends BasePlaylistController {
       }
     }
     if (currentTrack) {
+      // The group-ID is expected to change on a manifest refresh. Find the
+      // equivalent rendition in the new group by its identity (name and
+      // language) rather than its group, so an explicit user selection or the
+      // default track is carried over instead of resetting to a different
+      // (e.g. default English) rendition.
       const { name, lang, assocLang, characteristics, audioCodec, channels } =
         currentTrack;
+      // 1. Same name, language and audio characteristics (new group allowed).
+      //    This matches the parsed MediaPlaylist fields, so it works even when
+      //    the raw attributes do not carry LANGUAGE / NAME.
+      const equivalentOption = {
+        name,
+        lang,
+        assocLang,
+        characteristics,
+        audioCodec,
+        channels,
+      };
       for (let i = 0; i < audioTracks.length; i++) {
         const track = audioTracks[i];
-        if (
-          matchesOption(
-            { name, lang, assocLang, characteristics, audioCodec, channels },
-            track,
-            audioMatchPredicate,
-          )
-        ) {
+        if (matchesOption(equivalentOption, track, audioMatchPredicate)) {
           return i;
         }
       }
+      // 2. Same language but a renamed rendition (e.g. "zh-main" ->
+      //    "zh-main-v2"): the NAME differs, so match on language and the
+      //    other media attributes.
+      const renamedOption = { lang, assocLang, characteristics };
+      for (let i = 0; i < audioTracks.length; i++) {
+        const track = audioTracks[i];
+        if (matchesOption(renamedOption, track, audioMatchPredicate)) {
+          return i;
+        }
+      }
+      // 3. Fall back to comparing the raw media attributes. Only the listed
+      //    identity attributes are compared, so GROUP-ID / NAME differences
+      //    between refreshes do not prevent a match.
       for (let i = 0; i < audioTracks.length; i++) {
         const track = audioTracks[i];
         if (
@@ -408,6 +442,14 @@ class AudioTrackController extends BasePlaylistController {
             'LANGUAGE',
           ])
         ) {
+          return i;
+        }
+      }
+      // 4. Last resort: same language only, using the parsed lang field.
+      const langOnlyOption = { lang, assocLang };
+      for (let i = 0; i < audioTracks.length; i++) {
+        const track = audioTracks[i];
+        if (matchesOption(langOnlyOption, track, audioMatchPredicate)) {
           return i;
         }
       }
